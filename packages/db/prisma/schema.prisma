@@ -1,0 +1,16 @@
+// use prisma-8
+
+model User {
+  id            String      @id     @default(uuid())
+  username      String
+  password      String
+  todo          Post[]
+}
+
+model Post {
+  id            String      @id     @default(uuid())
+  task          String
+  done          Boolean             @default(false)
+  userId        String
+  user          User                @relation(fields: [userId], references: [id])
+}
