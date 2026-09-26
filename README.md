@@ -1,159 +1,152 @@
-# Turborepo starter
+# monorepo-deploy
 
-This Turborepo starter is maintained by the Turborepo core team.
+A Bun + Turborepo monorepo with three apps (a Next.js frontend, an Express REST API, and a WebSocket server) sharing one Postgres database through Prisma 8. Each app is built into its own Docker image and deployed to an EC2 VM by GitHub Actions on every push to `main`.
 
-## Using this example
+## Architecture
 
-Run the following command:
-
-```sh
-npx create-turbo@latest
+```
+                 ┌───────────────┐
+ Browser ──────▶ │ frontend :3000│──┐
+   │             └───────────────┘  │
+   │             ┌───────────────┐  │     ┌──────────┐
+   ├───────────▶ │ backend  :3001│──┼───▶ │ Postgres │
+   │             └───────────────┘  │     └──────────┘
+   │             ┌───────────────┐  │
+   └═══════════▶ │ ws       :8081│──┘
+                 └───────────────┘
 ```
 
-## What's inside?
+| App | Path | Port | What it does |
+|---|---|---|---|
+| frontend | `apps/web` | 3000 | Next.js page that renders users server-side |
+| backend | `apps/backend` | 3001 | Express API: `GET /users`, `POST /user` |
+| ws | `apps/ws` | 8081 | Bun WebSocket server: creates a user per message, echoes it back |
 
-This Turborepo includes the following packages/apps:
+All three import the same database client from the shared `db` package.
 
-### Apps and Packages
+## Tech stack
 
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `@next/eslint-plugin-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
+- **Runtime and package manager:** Bun 1.4.2
+- **Monorepo:** Turborepo with Bun workspaces
+- **Database:** PostgreSQL 18, accessed with Prisma 8 (`@prisma/orm-postgres`)
+- **Containers:** Docker, Docker Compose
+- **CI/CD:** GitHub Actions → Docker Hub → EC2 over SSH
 
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
+## Repository layout
 
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+```
+apps/
+  backend/            Express API
+  web/                Next.js frontend
+  ws/                 WebSocket server
+packages/
+  db/                 Prisma schema, migrations, and the shared `db` client
+  ui/                 Shared React components
+  eslint-config/
+  typescript-config/
+docker/
+  Dockerfile.backend
+  Dockerfile.frontend
+  Dockerfile.ws
+.github/workflows/    One deploy workflow per app
+docker-compose.yml    Full stack locally: Postgres + migrations + all three apps
 ```
 
-Without global `turbo`, use your package manager:
+## Running locally
 
-```sh
-cd my-turborepo
-npx turbo build
-bun exec turbo build
-bun exec turbo build
+**Prerequisites:** Bun 1.4.2 and Docker. The repo pins Bun as its package manager, so use `bun` and `bunx`, not `npm` and `npx`.
+
+1. Install dependencies:
+   ```bash
+   bun install
+   ```
+2. Start Postgres:
+   ```bash
+   docker run -d --name postgres -e POSTGRES_PASSWORD=mysecretpassword -p 5432:5432 postgres:18
+   ```
+3. Create a `.env` file in `packages/db`, `apps/backend`, `apps/ws`, and `apps/web`, each containing:
+   ```
+   DATABASE_URL="postgresql://postgres:mysecretpassword@localhost:5432/postgres"
+   ```
+   Every app needs its own copy, because `.env` is read from the directory the app runs in.
+4. Apply migrations:
+   ```bash
+   cd packages/db && bunx prisma db migrate && cd ../..
+   ```
+5. Start all three apps:
+   ```bash
+   bun run dev
+   ```
+
+### Running the full stack with Docker Compose
+
+```bash
+docker compose up --build
 ```
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+This starts Postgres, runs migrations once in a `migrate` container, then starts the three apps on the same ports as above. Use `docker compose down -v` to stop everything and delete the database volume.
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+## Changing the database schema
 
-```sh
-turbo build --filter=docs
+The database client uses the Prisma 8 API, which differs from earlier Prisma versions:
+
+```ts
+import { db } from "db";
+
+await db.orm.public.User.all();
+await db.orm.public.User.create({ username, password });
 ```
 
-Without global `turbo`:
+To change the schema:
 
-```sh
-npx turbo build --filter=docs
-bun exec turbo build --filter=docs
-bun exec turbo build --filter=docs
+1. Edit `packages/db/prisma/schema.prisma`. The file must start with `// use prisma-8`.
+2. Regenerate the client types, then plan a migration:
+   ```bash
+   cd packages/db
+   bunx prisma contract emit
+   bunx prisma migration plan --name <describe-the-change>
+   ```
+3. Review the generated folder under `packages/db/migrations/`, and commit it together with `schema.prisma`, `schema.json`, and `schema.d.ts`.
+
+Migrations are planned on a developer machine and committed. They're only applied at deploy time, never planned there.
+
+## Deployment
+
+### How it works
+
+Each app has its own workflow in `.github/workflows/`. On a push to `main`, a workflow runs only if files that app depends on changed. Each run then:
+
+1. Builds the app's image from its Dockerfile.
+2. Pushes it to Docker Hub, tagged `latest` and with the commit SHA.
+3. SSHes into the VM, pulls the SHA-tagged image, and replaces the running container.
+
+The backend workflow also runs `prisma db migrate` on the VM before starting the new container. If the migration fails, the old backend keeps running.
+
+### GitHub secrets
+
+| Secret | Value |
+|---|---|
+| `DOCKER_USERNAME` | Docker Hub username |
+| `DOCKER_PASSWORD` | Docker Hub access token with Read & Write permission |
+| `SSH_PRIVATE_KEY` | Private key for the VM. Set it with `gh secret set SSH_PRIVATE_KEY < key.pem` |
+| `VM_HOST` | Public IP of the VM |
+| `VM_USER` | SSH user, e.g. `ubuntu` on an Ubuntu EC2 instance |
+
+### One-time VM setup (Ubuntu)
+
+```bash
+sudo apt-get update && sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER        # then log out and back in
+
+docker run -d --name postgres --restart unless-stopped \
+  -e POSTGRES_PASSWORD=<password> \
+  -v pgdata:/var/lib/postgresql \
+  -p 5432:5432 postgres:18
+
+echo 'DATABASE_URL=postgresql://postgres:<password>@172.17.0.1:5432/postgres' > ~/app.env
 ```
 
-### Develop
+`172.17.0.1` is the address containers use to reach the VM itself. If the Docker Hub repositories are private, also run `docker login` on the VM.
 
-To develop all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo dev
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo dev
-bun exec turbo dev
-bun exec turbo dev
-```
-
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo dev --filter=web
-bun exec turbo dev --filter=web
-bun exec turbo dev --filter=web
-```
-
-### Remote Caching
-
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
-bun exec turbo login
-bun exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-bun exec turbo link
-bun exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+**Security group inbound rules:** allow TCP 22 (SSH, used by GitHub Actions), 3000, 3001, and 8081. Don't open 5432.
