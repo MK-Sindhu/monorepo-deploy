@@ -44,6 +44,8 @@ jobs:
                 ssh -o StrictHostKeyChecking=no -i ~/ssh_key ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "
                   set -e
                   docker pull ${{ secrets.DOCKER_USERNAME }}/backend:${{ github.sha }}
+                  docker run --rm --env-file ~/app.env -w /usr/src/app/packages/db \
+                    ${{ secrets.DOCKER_USERNAME }}/backend:${{ github.sha }} bunx prisma db migrate
                   docker rm -f user_backend 2>/dev/null || true
                   docker run -d --name user_backend --restart unless-stopped \
                     -p 3001:3001 --env-file ~/app.env \
