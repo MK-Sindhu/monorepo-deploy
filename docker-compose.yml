@@ -1,0 +1,62 @@
+x-database-url: &database-url
+  DATABASE_URL: postgresql://postgres:mysecretpassword@db:5432/postgres
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: mysecretpassword
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    working_dir: /usr/src/app/packages/db
+    command: ["bunx", "prisma", "db", "migrate"]
+    environment: *database-url
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "3001:3001"
+    environment: *database-url
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  ws:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ws
+    ports:
+      - "8081:8081"
+    environment: *database-url
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment: *database-url
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
